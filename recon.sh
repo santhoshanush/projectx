@@ -9,7 +9,9 @@ trap "echo -e '\n\033[0;31mProcess interrupted. Exiting...\033[0m'; stty intr ^C
 # Files & Directories
 RESULTS_FILE="scan_results.txt"
 LOG_DIR="logs"
+FILTERS_DIR="./filters"
 mkdir -p "$LOG_DIR"
+USERLIST="/usr/share/wordlists/seclists/Usernames/top-usernames-shortlist.txt"
 
 # Colors
 RED='\033[0;31m'    # Critical
@@ -18,69 +20,6 @@ GREEN='\033[0;32m'  # Success
 BLUE='\033[0;34m'   # Info
 NC='\033[0m'        # No Color
 
-# --- Filter Functions ---
-
-filter_gobuster() {
-    local log_file=$1
-    echo -e "\n${BLUE}[+] Gobuster Results:${NC}"
-    # Remove ANSI escape codes and filter relevant lines
-    grep -E '^\s*/.*\(Status: (200|403|301)\)' "$log_file" | sed 's/\x1B\[[0-9;]*[mK]//g' | awk '{printf "%-40s %s\n", $1, $2}' || echo -e "${GREEN}No directories found.${NC}"
-}
-
-filter_hydra() {
-    local log_file=$1
-    echo -e "\n${BLUE}[+] Hydra Results:${NC}"
-    if grep -q "login:" "$log_file"; then
-        grep "login:" "$log_file" | awk -F"login:" '{print $2}' | sed 's/^[ \t]*//'
-    else
-        echo -e "${GREEN}No credentials found.${NC}"
-    fi
-}
-
-filter_ffuf() {
-    local log_file=$1
-    echo -e "\n${BLUE}[+] FFUF Results:${NC}"
-    if grep -q "\[Status:" "$log_file"; then
-        grep "\[Status:" "$log_file" | awk '{printf "%-40s Status:%-5s Size:%-6s Words:%-5s\n", $1, $3, $5, $7}'
-    else
-        echo -e "${GREEN}No valid results.${NC}"
-    fi
-}
-
-filter_wfuzz() {
-    local log_file=$1
-    echo -e "\n${BLUE}[+] Wfuzz Results (Valid Subdomains/VHOSTs):${NC}"
-    if grep -q "00000" "$log_file"; then
-        grep -v "404" "$log_file" | awk '/00000/ {print $2}' | sort -u
-    else
-        echo -e "${GREEN}No subdomains/VHOSTs found.${NC}"
-    fi
-}
-
-filter_sqlmap() {
-    local log_file=$1
-    echo -e "\n${BLUE}[+] SQLMap Results:${NC}"
-    
-    # Extract databases
-    if grep -q "available databases" "$log_file"; then
-        echo -e "${YELLOW}=== Databases Found ===${NC}"
-        sed -n '/available databases/,/^$/p' "$log_file" | grep -v "available databases" | sed '/^$/d'
-    fi
-
-    # Extract tables
-    if grep -q "Database:" "$log_file"; then
-        echo -e "\n${YELLOW}=== Tables Found ===${NC}"
-        grep -A 100 "Database:" "$log_file" | grep -vE "^--$|^$"
-    fi
-
-    # Check for SQLi vulnerabilities
-    if grep -q "is vulnerable" "$log_file"; then
-        echo -e "\n${RED}=== Vulnerabilities ===${NC}"
-        grep "is vulnerable" "$log_file"
-    else
-        echo -e "${GREEN}No SQL injection vulnerabilities found.${NC}"
-    fi
-}
 
 # --- Main Script ---
 
@@ -94,109 +33,262 @@ OPEN_PORTS=$(grep -oP '^\d+/tcp\s+open' "$RESULTS_FILE" | awk -F/ '{print $1}')
 [[ "${OPEN_PORTS[@]}" =~ '139' && "${OPEN_PORTS[@]}" =~ '445' ]] && OPEN_PORTS=${OPEN_PORTS[@]/139/}
 
 for port in $OPEN_PORTS; do
-    LOG_FILE="$LOG_DIR/port_${port}.log"
+      LOG_FILE="$LOG_DIR/port_${port}.log"
     echo -e "\n${YELLOW}Scanning port $port...${NC}"
 
     case $port in
-        22)  # SSH Port
-            echo -e "${BLUE}[+] SSH detected. Running tests...${NC}" | tee -a "$LOG_FILE"
-    
-    # 1. Version/algorithm scan
-            echo -e "\n${YELLOW}=== SSH Version Detection ===${NC}" | tee -a "$LOG_FILE"
-            nmap -sV -p 22 --script=ssh2-enum-algos,ssh-auth-methods "$TARGET_IP" | tee -a "$LOG_FILE"
-    
-    # 2. Security audit (optional)
-            if command -v ssh-audit &>/dev/null; then
-                echo -e "\n${YELLOW}=== SSH Security Audit ===${NC}" | tee -a "$LOG_FILE"
-                ssh-audit "$TARGET_IP" | tee -a "$LOG_FILE"
-            else
-                echo -e "${YELLOW}ssh-audit not installed. Skipping audit.${NC}" | tee -a "$LOG_FILE"
-            fi
-    # 3. Brute-force (user choice)
-            read -p "Run Hydra brute-force attack? (Y/N): " choice
+        22)
+            echo -e "\n${BLUE}[+] Scanning SSH (Port 22)...${NC}"
+            nmap -sV -p 22 --script=ssh2-enum-algos,ssh-auth-methods "$TARGET_IP" -oN "$LOG_DIR/ssh_scan.log" >/dev/null 2>&1
+            echo -e "${GREEN}SSH Version: $(grep -oP 'ssh.*' "$LOG_DIR/ssh_scan.log" | head -1)${NC}"
+
+            # Brute-force prompt
+            read -p "$(echo -e ${YELLOW}'Run Hydra brute-force? (Y/N): '${NC})" choice
             if [[ "${choice^^}" == "Y" ]]; then
-                echo -e "\n${RED}[!] WARNING: Brute-forcing may trigger locks!${NC}" | tee -a "$LOG_FILE"
+                echo -e "${RED}[!] WARNING: Brute-forcing may trigger locks!${NC}"
+    
+                # Run Hydra with filtered output
                 hydra -L /usr/share/wordlists/metasploit/unix_users.txt \
-                  -P /usr/share/wordlists/rockyou.txt \
-                  ssh://"$TARGET_IP" -t 4 -vV | tee -a "$LOG_FILE"
-                filter_hydra "$LOG_FILE"  # <--- Filtering applied here!
-            else
-                echo -e "${GREEN}Skipping brute-force.${NC}" | tee -a "$LOG_FILE"
+                 -P /usr/share/wordlists/rockyou.txt \
+                 ssh://"$TARGET_IP" -t 4 -vV > "$LOG_DIR/ssh_hydra.log" 2>&1
+                # Show filtered results
+                if [ -f "$FILTERS_DIR/filter_hydra.sh" ]; then
+                    echo -e "\n${GREEN}[+] SSH Brute-Force Results:${NC}"
+                    "$FILTERS_DIR/filter_hydra.sh" "$LOG_DIR/ssh_hydra.log"
+                fi       
+                else
+                echo -e "${GREEN}Skipping brute-force.${NC}"
             fi
             ;;
+
+        23)
+        echo -e "\n${BLUE}Telnet service detected ...."
+         read -p "$(echo -e ${YELLOW}'Run Hydra brute-force? (Y/N): '${NC})" choice
+            if [[ "${choice^^}" == "Y" ]]; then
+                echo -e "${RED}[!] WARNING: Brute-forcing may trigger locks!${NC}"
+    
+                # Run Hydra with filtered output
+                hydra -L /usr/share/wordlists/metasploit/unix_users.txt \
+                 -P /usr/share/wordlists/rockyou.txt \
+                 telnet://"$TARGET_IP" -t 4 -vV > "$LOG_DIR/telnet_hydra.log" 2>&1
+                # Show filtered results
+                if [ -f "$FILTERS_DIR/filter_hydra.sh" ]; then
+                    echo -e "\n${GREEN}[+] Telnet Brute-Force Results:${NC}"
+                    "$FILTERS_DIR/filter_hydra.sh" "$LOG_DIR/telnet_hydra.log"
+                fi       
+            else
+                echo -e "${GREEN}Skipping brute-force.${NC}"
+            fi
+        ;;
             
        80|443)
-            # Gobuster (still shows progress)
-            echo -e "${BLUE}Running Gobuster...${NC}"
-            [[ $port -eq 80 ]] && url="http://$TARGET_IP/" || url="https://$TARGET_IP/"
-            gobuster dir -u "$url" -w /usr/share/wordlists/dirb/common.txt -t 50 -x php,html,txt -b 403,404 | tee -a "$LOG_FILE"
-            filter_gobuster "$LOG_FILE"
+            # --- HTTP Scan (Port 80) ---
+            echo -e "\n${BLUE}[+] Scanning HTTP(s) (Port 80 | 443)...${NC}"
+            if [[ $port == 80 ]]; then
+                URL="http://$TARGET_IP/"
+            else 
+                URL="https://$TARGET_IP/"
+            fi
+            # Gobuster scan
+            gobuster dir -u $URL  \
+            -w /usr/share/wordlists/dirb/common.txt \
+             -t 50 -x php,html,txt -b 403,404 \
+             -q --no-color > "$LOG_DIR/gobuster.log" 2>&1
+             if [ -f "$FILTERS_DIR/filter_gobuster.sh" ]; then
+                    "$FILTERS_DIR/filter_gobuster.sh" "$LOG_DIR/gobuster.log"
+             fi
 
             # FFUF (still shows progress)
-            echo -e "${BLUE}Running FFUF...${NC}"
-            ffuf -u "${url}FUZZ" -w /usr/share/wordlists/dirb/common.txt -of csv -o "$LOG_DIR/ffuf_$port.csv" >/dev/null 2>&1
-            filter_ffuf "$LOG_DIR/ffuf_$port.csv"
-
-            # Wfuzz (SILENT - only shows filtered results)
-            echo -e "${BLUE}Running Wfuzz for VHOSTs...${NC}"
-            wfuzz -w /usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-110000.txt \
-                  -H "Host: FUZZ.$TARGET_IP" \
-                  --hc 404 \
-                  "$url" > "$LOG_DIR/wfuzz_vhosts.log" 2>&1
-            filter_wfuzz "$LOG_DIR/wfuzz_vhosts.log"  # <-- Only filtered results display
+            #echo -e "${BLUE}Running FFUF...${NC}"
+            #ffuf -u "${url}FUZZ" -w /usr/share/wordlists/dirb/common.txt -of csv -o "$LOG_DIR/ffuf_$port.csv" >/dev/null 2>&1
+            #filter_ffuf "$LOG_DIR/ffuf_$port.csv"
+            
             ;;
 
         3306)
-            # SQLMap (SILENT - only shows filtered results)
-            echo -e "${BLUE}Running SQLMap...${NC}"
-            sqlmap -u "http://$TARGET_IP/" \
-                   --batch \
-                   --crawl=2 \
-                   --level=3 \
-                   --risk=2 \
-                   --output-dir="$LOG_DIR/sqlmap" > "$LOG_DIR/sqlmap.log" 2>&1
-            filter_sqlmap "$LOG_DIR/sqlmap.log"  # <-- Only filtered results display
 
-            # Hydra (still interactive)
-            read -p "Brute-force MySQL? (Y/N): " choice
-            if [[ "${choice^^}" == "Y" ]]; then
-                hydra -L /usr/share/wordlists/metasploit/unix_users.txt \
-                      -P /usr/share/wordlists/rockyou.txt \
-                      "$TARGET_IP" mysql -t 4 -vV | tee -a "$LOG_FILE"
-                filter_hydra "$LOG_FILE"
+            echo -e "\n${BLUE}[+] Starting MySQL Recon ..."
+
+            # --- Phase 1: Service Detection ---
+            echo -e "\n${YELLOW}[*] Verifying MySQL service...${NC}"
+            nmap -p 3306 --script=mysql-info ${TARGET_IP} -oN "${LOG_DIR}/mysql_service.log" >/dev/null 2>&1
+
+            if grep -q "mysql" "${LOG_DIR}/mysql_service.log"; then
+             mysql_version=$(grep -oP "Version: \K[^\n]+" "${LOG_DIR}/mysql_service.log")
+             echo -e "${GREEN}[+] MySQL Detected: ${mysql_version}${NC}"
+            else
+                echo -e "${RED}[-] MySQL not found on port ${MYSQL_PORT}${NC}"
+            exit 1
             fi
+
+            # --- Phase 2: Default Credential Check ---
+            echo -e "\n${YELLOW}[*] Testing default MySQL credentials...${NC}"
+
+            declare -A creds=(
+                    ["root"]="root"
+                    ["root"]=""
+                    ["admin"]="admin"
+                    ["mysql"]="mysql"
+                    )   
+
+            found_creds=false
+            for user in "${!creds[@]}"; do
+                echo -ne "Testing ${user}:${creds[$user]}... "
+                if mysql -h ${TARGET_IP} -u ${user} -p"${creds[$user]}" -e "SELECT 1" 2>/dev/null | grep -q "1"; then
+                    echo -e "${GREEN}SUCCESS${NC}"
+                    echo "Valid credentials: ${user}:${creds[$user]}" >> "${LOG_DIR}/mysql_creds.log"
+                    found_creds=true
+                else
+                    echo -e "${RED}FAILED${NC}"
+                fi
+            done
+
+            if [ "$found_creds" = false ]; then
+                echo -e "${YELLOW}[-] No default credentials worked${NC}"
+            fi
+
+            # --- Phase 3: SQL Injection Test ---
+            echo -e "\n${YELLOW}[*] SQL Injection Testing${NC}"
+            read -p "Enter URL to test for SQLi (e.g., http://target.com/page?id=1): " sqlmap_url
+
+            if [ -n "$sqlmap_url" ]; then
+                echo -e "${BLUE}[+] Running SQLMap against: ${sqlmap_url}${NC}"
+                sqlmap -u "${sqlmap_url}" --batch --level=3 --risk=2 --output-dir="${LOG_DIR}/sqlmap" > "${LOG_DIR}/sqlmap.log" 2>&1
+    
+                echo -e "\n${GREEN}[+] SQL Injection Results:${NC}"
+                if grep -q "is vulnerable" "${LOG_DIR}/sqlmap.log"; then
+                    grep -A5 "is vulnerable" "${LOG_DIR}/sqlmap.log"
+                    echo -e "\n${RED}[!] VULNERABLE TO SQL INJECTION${NC}"
+                else
+                    echo -e "${GREEN}[+] No SQL injection vulnerabilities found${NC}"
+                fi
+            else
+                echo -e "${YELLOW}[-] Skipping SQL injection test (no URL provided)${NC}"
+            fi
+
+            swecho -e "\n${BLUE}[+] MySQL reconnaissance complete. Logs saved to ${LOG_DIR}/${NC}"
             ;;
         21)
             # FTP checks + Hydra
             echo -e "${BLUE}Checking FTP...${NC}"
-            ftp -inv "$TARGET_IP" <<EOF | tee -a "$LOG_FILE"
+            ftp -inv "$TARGET_IP" <<EOF | tee -a "$LOG_DIR/ftp.log"
 user anonymous anonymous
 quit
 EOF
             [[ $? -eq 0 ]] && { echo -e "${RED}Anonymous FTP login allowed!${NC}"; }
             ;;
         
-       53)
+    #   53)
     # DNS Enumeration (Silent Wfuzz)
-    echo -e "${BLUE}[+] Running DNS Enumeration...${NC}"
+    #echo -e "${BLUE}[+] Running DNS Enumeration...${NC}"
     
     # 1. Reverse DNS lookup
-    domain=$(dig -x "$TARGET_IP" +short 2>/dev/null | head -n1 | sed 's/\.$//')
-    [[ -z "$domain" ]] && domain="$TARGET_IP"
+    #domain=$(dig -x "$TARGET_IP" +short 2>/dev/null | head -n1 | sed 's/\.$//')
+    #[[ -z "$domain" ]] && domain="$TARGET_IP"
     
     # 2. Wfuzz subdomain scan (silent)
-    wfuzz -w /usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-110000.txt \
-          -H "Host: FUZZ.$domain" \
-          --hc 404 \
-          "http://$domain" > "$LOG_DIR/wfuzz_dns.log" 2>&1
+    #wfuzz -w /usr/share/wordlists/seclists/Discovery/DNS/subdomains-top1million-110000.txt \
+     #     -H "Host: FUZZ.$domain" \
+      #    --hc 404 \
+       #   "http://$domain" > "$LOG_DIR/wfuzz_dns.log" 2>&1
     
     # 3. Show filtered results only
-    filter_wfuzz "$LOG_DIR/wfuzz_dns.log"
-    ;;
+    #filter_wfuzz "$LOG_DIR/wfuzz_dns.log"
+    #;;
+
+        25)
+        echo -e "\n${BLUE}Testing for known SMTP vulnerabilities ..."
+        # VRFY command check and user enumeration using the specified userlist
+        echo -e "\n${NC}Attempting user enumeration with VRFY command..."
+        while IFS= read -r user; do
+            VRFY_RESULT=$(echo "VRFY $user" | nc -w 5 "$TARGET_IP" 25 2>/dev/null)
+            if echo "$VRFY_RESULT" | grep -qi "252"; then
+                echo "[+] User '$user' exists on the SMTP server!"
+            fi
+        done < "$USERLIST"
+
+        # Open relay check
+        echo -e "\n${BLUE}Testing for SMTP Open Relay..."
+        echo -e "\n${NC}MAIL FROM:<attacker@example.com>\nRCPT TO:<victim@example.com>\nQUIT" | nc -w 5 "$TARGET_IP" 25 2>/dev/null | grep -qi "Relaying denied"
+        if [ $? -eq 0 ]; then
+            echo "[+] No open relay detected – SMTP server is secure against relay abuse."
+        else
+            echo "[!] WARNING: SMTP server may be an open relay! Relaying not denied."
+        fi
+
+        echo -e "\n${GREEN}SMTP enumeration, user enumeration, and vulnerability scan completed!"
+        ;;
+
+        135)
+        echo -e "\n${BLUE}Testing for known RPC vulnerabilities ..."
+# Example vulnerability check using rpcinfo to test for specific services
+        if rpcinfo -p "$TARGET_IP" | grep -q "100003"; then
+            echo -e "\n${RED}[+] NFS RPC service detected (program number 100003)."
+            echo -e "\n${RED}[!] Check for potential NFS-related vulnerabilities."
+        fi
+
+        if rpcinfo -p "$TARGET_IP" | grep -q "100005"; then
+            echo -e "\n${RED}[+] Mountd RPC service detected (program number 100005)."
+            echo -e "\n${RED}[!] Check for potential NFS mount vulnerabilities."
+        fi
+
+        if rpcinfo -p "$TARGET_IP" | grep -q "100000"; then
+            echo -e "\n${RED}[+] Portmapper detected. Be cautious of potential remote exploits."
+        fi
+
+        echo -e "\nRPC service enumeration and vulnerability check completed!"
+        RPC_OUTPUT=$(rpcinfo -p $TARGET_IP 2>/dev/null)
+
+        if [ -z "$RPC_OUTPUT" ]; then
+            echo "No RPC services detected on $TARGET_IP."
+        exit 1
+        fi
+        ;;
+
+        139|445)
+        printf "\n\n${YELLOW}[+] SMB service is open and enumerating the shares...${NC}\n"   | tee -a "$LOG_FILE"
+            nmap --script smb-enum-shares -p 139,445 $TARGET_IP  | tee -a "$LOG_FILE"
+            printf "\n\n${YELLOW}[*] Looking for Eternal Blue vulnerability.........${NC}"   | tee -a "$LOG_FILE"
+            nmap -p445 --script smb-vuln-ms17-010 $TARGET_IP  | tee -a  "$LOG_FILE" 
+            if grep -q "CVE-2017-0143" "$LOG_FILE"; then
+                printf "\n\n${RED}[+] Eternal Blue vulnerability is present${NC}\n" | tee -a "$LOG_FILE"
+            else
+                printf "\n\n${GREEN}[-] Eternal Blue vulnerability is not present${NC}\n" | tee -a "$LOG_FILE"
+            fi
+        enum4linux -U $TARGET_IP > temp.txt
+            grep -Po '\[.*]' temp.txt | awk 'BEGIN{FS=" "} {print $1}' > temp2.txt
+            if [ -s temp2.txt ]
+            then
+                printf "\n${YELLOW}The list of users found in this system...${NC}\n\n" | tee -a "$LOG_FILE"
+                while read user; do
+                   printf "\n${RED}${user}${NC}" | tee -a "$LOG_FILE"
+                done <temp2.txt
+            else
+                printf "\n${GREEN}No users found in this system using SMB${NC}\n" | tee -a "$LOG_FILE"
+            fi
+            rm temp.txt temp2.txt
+        printf "\n"
+        ;;
 
         *)
             echo -e "${GREEN}No automation for port $port.${NC}"
             ;;
+
+8000)
+            # --- HTTP Scan (Port 8000) ---
+            echo -e "\n${BLUE}[+] Scanning custom HTTP (Port 8000)...${NC}"
+            URL="http://$TARGET_IP:8000/"
+            # Gobuster scan
+            gobuster dir -u $URL  \
+            -w /usr/share/wordlists/dirb/common.txt \
+             -t 50 -x php,html,txt -b 403,404 \
+             -q --no-color > "$LOG_DIR/gobuster.log" 2>&1
+             if [ -f "$FILTERS_DIR/filter_gobuster.sh" ]; then
+                    "$FILTERS_DIR/filter_gobuster.sh" "$LOG_DIR/gobuster.log"
+             fi
+            
+            ;;
+
     esac
 done
 
